@@ -1,0 +1,10 @@
+*.pyc
+*.log
+*.json
+*.html
+
+# 忽略utils文件夹中的lib文件夹
+utils/lib/
+
+# 忽略lightrag_store文件夹
+lightrag_store/
