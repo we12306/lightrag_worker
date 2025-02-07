@@ -12,29 +12,26 @@ import torch
 import numpy as np
 import asyncio
 import nest_asyncio
+
 nest_asyncio.apply()
 lock = asyncio.Lock()
 
 from FlagEmbedding import BGEM3FlagModel
 
-@dataclass
-class CustomModelConfig(HModelConfig):
-    name: str = field(default="hepai/lightrag", metadata={"help": "Model's name"})
-    permission: Union[str, Dict] = field(default=None, metadata={"help": "Model's permission, separated by ;, e.g., 'groups: all; users: a, b; owner: c', will inherit from worker permissions if not setted"})
-    version: str = field(default="2.0", metadata={"help": "Model's version"})
+import logging
+logger = logging.getLogger(__name__)
 
-@dataclass
-class CustomWorkerConfig(HWorkerConfig):
-    host: str = field(default="0.0.0.0", metadata={"help": "Worker's address, enable to access from outside if set to `0.0.0.0`, otherwise only localhost can access"})
-    port: int = field(default=4260, metadata={"help": "Worker's port, default is None, which means auto start from `auto_start_port`"})
-    auto_start_port: int = field(default=42602, metadata={"help": "Worker's start port, only used when port is set to `auto`"})
-    route_prefix: str = field(default="/apiv2", metadata={"help": "Route prefix for worker"})
+# 加载本地.env文件
+from dotenv import load_dotenv
+load_dotenv()
+## 变量加载
+Embedding_model_path = os.getenv("Embedding_model_path") # 嵌入模型路径
+embedding_dimension = int(os.getenv("embedding_dimension"))  # 嵌入维度
+max_token_size = int(os.getenv("max_token_size"))  # 最大token长度
+gpu_id = int(os.getenv("gpu_id"))  # GPU设备ID
+llm_api_key = os.getenv("llm_api_key")  # hepai api key
+llm_base_url = os.getenv("llm_base_url")  # hepai base url
 
-    permissions: str = field(default='users: admin', metadata={"help": "Model's permissions, separated by ;, e.g., 'groups: default; users: a, b; owner: c'"})
-    description: str = field(default='This is a demo worker of HEP AI framework (HepAI)', metadata={"help": "Model's description"})
-    author: str = field(default=None, metadata={"help": "Model's author"})
-    debug: bool = field(default=True, metadata={"help": "Debug mode"})
-    daemon: bool = field(default=False, metadata={"help": "Run as daemon"})
 
 class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting from HRModel.
     def __init__(self, config: HModelConfig):
@@ -47,8 +44,8 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
             model = "openai/gpt-4o-mini",
             system_prompt=None, 
             history_messages=[], 
-            api_key=os.getenv("HEPAI_API_KEY2"), 
-            base_url=os.getenv("BASE_URL_V2"),
+            api_key=llm_api_key, 
+            base_url=llm_base_url,
             keyword_extraction=False, 
             **kwargs) -> str:
         
@@ -68,7 +65,8 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
         kwargs.pop("keyword_extraction", None)
         params.update(kwargs)
         response = hepai_client.chat.completions.create(**params)
-
+        logger.info(f"Call hepai model: {model}")
+        # 异步迭代返回结果
         if hasattr(response, "__aiter__"):
             async def inner():
                 async for chunk in response:
@@ -81,6 +79,7 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
 
             return inner()
         else:
+            # 同步返回结果
             content = response.choices[0].message.content
             if r"\u" in content:
                 content = safe_unicode_decode(content.encode("utf-8"))
@@ -102,19 +101,18 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
             self, 
             texts: list[str]) -> np.ndarray:
         # 设置使用的GPU设备
-        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-        device = torch.device("cuda:0")
+        # os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_id}"
+        device = torch.device(f"cuda:{gpu_id}")
         # 加载模型到指定GPU
-        embedding_model_path = "/data/szj/hai-rag-OS/embedding/BAAI/bge-m3/"
         model = BGEM3FlagModel(
-            embedding_model_path,
+            model_name_or_path = Embedding_model_path,
             use_fp16=True,  # 开启FP16加速推理
             device=device)  # 指定使用的GPU设备
         # 同步执行推理
         embeddings = model.encode(
             sentences=texts,
             batch_size=16,
-            max_length=8192)
+            max_length=max_token_size)
         # 异步执行推理
         # embeddings = await asyncio.to_thread(
         #     model.encode, 
@@ -155,6 +153,7 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
         custom_prompt: str = "",
         conversation_history: List[Dict] = [],
         history_turns: int = 3,
+        embedding_dimension = embedding_dimension,
         **kwargs) -> str:
         """
         Call the LightRAG model to generate a response.
@@ -182,8 +181,8 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
             working_dir=WORKING_DIR,
             llm_model_func=self.a_llm_model_func,
             embedding_func=EmbeddingFunc(
-                embedding_dim=1024,
-                max_token_size=8192,
+                embedding_dim=embedding_dimension,
+                max_token_size=max_token_size,
                 func=self.a_embedding_func
                 )
             )
@@ -204,6 +203,34 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
             return response
         except Exception as e:
             return f"LightRAG model call failed with Error: {e}"
+
+@dataclass
+class CustomModelConfig(HModelConfig):
+    name: str = field(default="hepai/lightrag", metadata={"help": "Model's name"})
+    permission: Union[str, Dict] = field(default=None, metadata={"help": "Model's permission, separated by ;, e.g., 'groups: all; users: a, b; owner: c', will inherit from worker permissions if not setted"})
+    version: str = field(default="2.0", metadata={"help": "Model's version"})
+
+@dataclass
+class CustomWorkerConfig(HWorkerConfig):
+    host: str = field(default="0.0.0.0", metadata={"help": "Worker's address, enable to access from outside if set to `0.0.0.0`, otherwise only localhost can access"})
+    port: int = field(default=4260, metadata={"help": "Worker's port, default is None, which means auto start from `auto_start_port`"})
+    auto_start_port: int = field(default=42602, metadata={"help": "Worker's start port, only used when port is set to `auto`"})
+    route_prefix: str = field(default="/apiv2", metadata={"help": "Route prefix for worker"})
+    controller_address: str = field(default="http://localhost:42601", metadata={"help": "Controller's address"})
+    # controller_address: str = field(default="https://aiapi001.ihep.ac.cn", metadata={"help": "Controller's address"})
+    controller_prefix: str = field(default="/apiv2", metadata={"help": "Controller's route prefix"})
+    
+    speed: int = field(default=1, metadata={"help": "Model's speed"})
+    limit_model_concurrency: int = field(default=5, metadata={"help": "Limit the model's concurrency"})
+    stream_interval: float = field(default=0., metadata={"help": "Extra interval for stream response"})
+    no_register: bool = field(default=True, metadata={"help": "Do not register to controller"})
+    permissions: str = field(default='users: admin; owner: xiongdb@ihep.ac.cn', metadata={"help": "Model's permissions, separated by ;, e.g., 'groups: default; users: a, b; owner: c'"})
+    description: str = field(default='This is a demo worker of HEP AI framework (HepAI)', metadata={"help": "Model's description"})
+    author: str = field(default="xiongdb@ihep.ac.cn", metadata={"help": "Model's author"})
+    api_key: str = field(default="", metadata={"help": "API key for reigster to controller, ensure the security"})
+    debug: bool = field(default=True, metadata={"help": "Debug mode"})
+    type: Literal["llm", "actuator", "preceptor", "memory", "common"] = field(default="common", metadata={"help": "Specify worker type, could be help in some cases"})
+    daemon: bool = field(default=False, metadata={"help": "Run as daemon"})
 
 
 if __name__ == "__main__":
