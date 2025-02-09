@@ -6,7 +6,7 @@
 .vscode
 
 # 忽略utils文件夹中的lib文件夹
-utils/lib/
+lightrag_hepai/utils/lib/
 
 # 忽略lightrag_store文件夹
 lightrag_store/

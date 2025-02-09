@@ -1,148 +1,57 @@
-from typing import Dict, Union, Literal, List
-from dataclasses import dataclass, field
-import json
+
 import hepai as hai
-from hepai import HRModel, HModelConfig, HWorkerConfig, HWorkerAPP
+from hepai import  HModelConfig, HWorkerConfig, HWorkerAPP, HRModel
+from lightrag_hepai.lightrag_hepai import LightRAG_HepAI
+from lightrag_hepai.utils.task_manager import TaskManager
 
-from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-from lightrag import LightRAG, QueryParam
-from lightrag.utils import EmbeddingFunc, safe_unicode_decode
-import os
-import torch
-import numpy as np
-import asyncio
-import nest_asyncio
-
-nest_asyncio.apply()
-lock = asyncio.Lock()
-
-from FlagEmbedding import BGEM3FlagModel
-
-import logging
-logger = logging.getLogger(__name__)
-
-# 加载本地.env文件
-from dotenv import load_dotenv
-load_dotenv()
-## 变量加载
-Embedding_model_path = os.getenv("Embedding_model_path") # 嵌入模型路径
-embedding_dimension = int(os.getenv("embedding_dimension"))  # 嵌入维度
-max_token_size = int(os.getenv("max_token_size"))  # 最大token长度
-gpu_id = int(os.getenv("gpu_id"))  # GPU设备ID
-llm_api_key = os.getenv("llm_api_key")  # hepai api key
-llm_base_url = os.getenv("llm_base_url")  # hepai base url
+from typing import Dict, Union, Literal, List, Optional
+from dataclasses import dataclass, field
+import threading
 
 
-class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting from HRModel.
+class LightRAGWorkerModel(HRModel):  # Define a custom worker model inheriting from HRModel.
     def __init__(self, config: HModelConfig):
         super().__init__(config=config)
-
-    # Define the openai_complete function for the LightRAG model.
-    async def a_llm_model_func(
-            self, 
-            prompt, 
-            model = "openai/gpt-4o-mini",
-            system_prompt=None, 
-            history_messages=[], 
-            api_key=llm_api_key, 
-            base_url=llm_base_url,
-            keyword_extraction=False, 
-            **kwargs) -> str:
         
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.extend(history_messages)
-        messages.append({"role": "user", "content": prompt})
-        hepai_client = hai.HepAI(api_key=api_key, base_url=base_url)
-
-        # 调用hepai接口
-        params = {
-            "model": model,
-            "messages": messages,
-        }
-        kwargs.pop("hashing_kv", None)
-        kwargs.pop("keyword_extraction", None)
-        params.update(kwargs)
-        response = hepai_client.chat.completions.create(**params)
-        logger.info(f"Call hepai model: {model}")
-        # 异步迭代返回结果
-        if hasattr(response, "__aiter__"):
-            async def inner():
-                async for chunk in response:
-                    content = chunk.choices[0].delta.content
-                    if content is None:
-                        continue
-                    if r"\u" in content:
-                        content = safe_unicode_decode(content.encode("utf-8"))
-                    yield content
-
-            return inner()
-        else:
-            # 同步返回结果
-            content = response.choices[0].message.content
-            if r"\u" in content:
-                content = safe_unicode_decode(content.encode("utf-8"))
-            return content
-        
-        # 调用openai接口
-        # return await openai_complete_if_cache(
-        #     prompt = prompt,
-        #     model = model,
-        #     system_prompt=system_prompt,
-        #     history_messages=history_messages,
-        #     api_key=api_key,
-        #     base_url=base_url,
-        #     **kwargs
-        # )
+        self.task_manager = TaskManager()
+        self.shutdown_flag = threading.Event()  # 安全关闭标志
     
-    # Define the embeddings function for the LightRAG model.
-    async def a_embedding_func(
-            self, 
-            texts: list[str]) -> np.ndarray:
-        # 设置使用的GPU设备
-        # os.environ["CUDA_VISIBLE_DEVICES"] = f"{gpu_id}"
-        device = torch.device(f"cuda:{gpu_id}")
-        # 加载模型到指定GPU
-        model = BGEM3FlagModel(
-            model_name_or_path = Embedding_model_path,
-            use_fp16=True,  # 开启FP16加速推理
-            device=device)  # 指定使用的GPU设备
-        # 同步执行推理
-        embeddings = model.encode(
-            sentences=texts,
-            batch_size=16,
-            max_length=max_token_size)
-        # 异步执行推理
-        # embeddings = await asyncio.to_thread(
-        #     model.encode, 
-        #     sentences = texts, 
-        #     batch_size=16, 
-        #     max_length=8192
-        #     )
-        return embeddings['dense_vecs']
-    
-    # 插入文档
-    async def insert_documents(
-            self, 
-            rag: LightRAG, 
-            embedding_texts: 
-            Union[str, List[str]]):
-        await rag.ainsert(string_or_strings=embedding_texts)
-    
-    # 查询文档
-    async def query_documents(
-            self, 
-            rag: LightRAG, 
-            query: str,
-            custom_prompt: str,
-            query_param: QueryParam) -> str:
-        response = await rag.aquery(
-            query=query, 
-            prompt=custom_prompt, 
-            param=query_param)
-        return response
+    def _background_processing(self, task_id: str, query: str, **kwargs):
+        """后台处理任务的强化版本"""
+        try:
+            self.task_manager.update_task(task_id, status="running", progress=10)
+            self.task_manager.append_log(task_id, "Starting processing")
+            
+            # 实际处理逻辑
+            lightrag_hepai = LightRAG_HepAI()
+            result = lightrag_hepai.interface(query=query, **kwargs)
+            
+            # 定期检查关闭标志
+            if self.shutdown_flag.is_set():
+                self.task_manager.append_log(task_id, "Processing interrupted by shutdown")
+                return
 
+            self.task_manager.update_task(
+                task_id,
+                status="completed",
+                progress=100,
+                result=result
+            )
+            self.task_manager.append_log(task_id, "Processing completed successfully")
+            
+        except Exception as e:
+            self.task_manager.update_task(
+                task_id,
+                status="failed",
+                error=str(e),
+                progress=100
+            )
+            self.task_manager.append_log(task_id, f"Processing failed: {str(e)}")
+
+    async def graceful_shutdown(self):
+        """安全关闭方法"""
+        self.shutdown_flag.set()
+        self.task_manager.executor.shutdown(wait=True)
 
     @HRModel.remote_callable  # Decorate the function to enable remote call.
     def interface(
@@ -153,7 +62,9 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
         custom_prompt: str = "",
         conversation_history: List[Dict] = [],
         history_turns: int = 3,
-        embedding_dimension = embedding_dimension,
+        user_name: str = "admin",
+        timeout: int = 60,
+        task_id: Optional[str] = None,
         **kwargs) -> str:
         """
         Call the LightRAG model to generate a response.
@@ -164,45 +75,138 @@ class CustomWorkerModel(HRModel):  # Define a custom worker model inheriting fro
             custom_prompt: The custom prompt for the lightRAG model.
             conversation_history: The conversation history.
             history_turns: The number of conversation turns to use for the conversation history.
+            user_name: The user name.
+            timeout: The query timeout.
+            task_id: The task id.
+            **kwargs: Other keyword arguments.
         Returns:
             The generated response string.
         """
         
-        # 设置缓存路径
-        WORKING_DIR = "./lightrag_store/"
-        ## 获取绝对路径
-        WORKING_DIR = os.path.abspath(WORKING_DIR)
-        ## 判断文件夹是否存在
-        if not os.path.exists(WORKING_DIR):
-            os.makedirs(WORKING_DIR)
+        # 检查是否存在相同任务
+        if task_id:
+            existing_task: dict = self.task_manager.get_task_status(task_id)
+            if existing_task:
+                return self._format_response(existing_task)
+        else:
+            task_id = self.task_manager.generate_task_id()
 
-        # 设置LightRAG instance
-        rag = LightRAG(
-            working_dir=WORKING_DIR,
-            llm_model_func=self.a_llm_model_func,
-            embedding_func=EmbeddingFunc(
-                embedding_dim=embedding_dimension,
-                max_token_size=max_token_size,
-                func=self.a_embedding_func
-                )
-            )
-        
-        # 插入文档
-        rag.insert(string_or_strings = embedding_texts)
-        # self.insert_documents(rag, embedding_texts)
-
-        # 设置查询参数
-        query_param = QueryParam(
+        # 初始化任务
+        task_info = self.task_manager.create_task(
+            task_id=task_id,
+            query=query,
             mode=mode,
+            embedding_texts = embedding_texts[:100]+"..." if isinstance(embedding_texts, str) else embedding_texts[0][:100]+"..." if isinstance(embedding_texts, list) else None,
+            custom_prompt=custom_prompt,
             conversation_history=conversation_history,
-            history_turns = history_turns
+            history_turns=history_turns,
+            user_name=user_name,
+            timeout=timeout,
+            **kwargs
         )
-        # response = self.query_documents(rag, query, custom_prompt, query_param)
-        response = rag.query(query=query, prompt=custom_prompt, param=query_param)
+
+        # 使用线程池提交任务
+        future = self.task_manager.executor.submit(
+            self._background_processing,
+            task_id=task_id,
+            query=query,
+            mode=mode,
+            embedding_texts = embedding_texts,
+            custom_prompt=custom_prompt,
+            conversation_history=conversation_history,
+            history_turns=history_turns,
+            user_name=user_name,
+            **kwargs
+        )
+        
         try:
-            return response
+            # 等待结果或超时
+            result = future.result(timeout=timeout)
+            # 检查处理结果
+            current_status = self.task_manager.get_task_status(task_id)
+            if current_status["status"] == "completed":
+                return current_status["result"]
+        # except TimeoutError:
+        #     # 超时处理
+        #     current_status = self.task_manager.get_task_status(task_id)
+        #     return self._handle_timeout(task_id, current_status)
         except Exception as e:
-            return f"LightRAG model call failed with Error: {e}"
+            if not str(e):
+                # 超时处理
+                current_status = self.task_manager.get_task_status(task_id)
+                return self._handle_timeout(task_id, current_status)
+            else:
+                return f"Task failed: {str(e)}"
+
+        # # 启动后台线程
+        # thread = threading.Thread(
+        #     target=self._background_task,
+        #     args=(task_id, query),
+        #     kwargs={
+        #         "mode": mode,
+        #         "embedding_texts": embedding_texts,
+        #         "custom_prompt": custom_prompt,
+        #         "conversation_history": conversation_history,
+        #         "history_turns": history_turns,
+        #         "user_name": user_name,
+        #         **kwargs
+        #     }
+        # )
+        # self.running_tasks[task_id] = thread
+        # thread.start()
+
+        # # 等待结果或超时
+        # thread.join(timeout=timeout)
+
+        # # 检查处理结果
+        # current_status = self.task_manager.get_task_status(task_id)
+        # if current_status["status"] == "completed":
+        #     return current_status["result"]
+        
+        # # 超时处理
+        # return self._handle_timeout(task_id, current_status)
+
+    def _format_response(self, task_info: Dict) -> str:
+        """格式化任务状态响应"""
+        status = task_info["status"]
+        if status == "completed":
+            return task_info["result"]
+        
+        log_file = task_info["log_file"]
+        with open(log_file, "r") as f:
+            logs = f.read()
+        
+        response = [
+            f"Task {task_info['task_id']} status: {status}",
+            f"Progress: {task_info.get('progress', 0)}%",
+            f"Logs:\n{logs[-2000:]}"  # 返回最后2000字符的日志
+        ]
+        
+        if task_info.get("error"):
+            response.append(f"Error: {task_info['error']}")
+        
+        return "\n\n".join(response)
+
+    def _handle_timeout(self, task_id: str, current_status: Dict) -> str:
+        """处理超时情况"""
+        base_response = [
+            "Request is processing in background",
+            "You can check status later using this ID in the following format:",
+            f"```Task ID: <{task_id}>```"
+        ]
+        
+        if current_status["status"] == "failed":
+            return f"Task failed immediately: {current_status.get('error', 'Unknown error')}"
+        
+        # 获取部分处理结果（如果有）
+        partial_result = current_status.get("result")
+        if partial_result:
+            base_response.insert(0, "Partial result:")
+            base_response.insert(1, partial_result)
+        
+        return "\n".join(base_response)
+
+
 
 @dataclass
 class CustomModelConfig(HModelConfig):
@@ -238,7 +242,7 @@ if __name__ == "__main__":
     import uvicorn
     from fastapi import FastAPI
     model_config, worker_config = hai.parse_args((CustomModelConfig, CustomWorkerConfig))
-    model = CustomWorkerModel(model_config)  # Instantiate the custom worker model.
+    model = LightRAGWorkerModel(model_config)  # Instantiate the custom worker model.
     app: FastAPI = HWorkerAPP(model, worker_config=worker_config)  # Instantiate the APP, which is a FastAPI application.
 
     print(app.worker.get_worker_info(), flush=True)

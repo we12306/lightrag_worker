@@ -1,0 +1,3 @@
+hepai>=1.1.24
+FlagEmbedding>=1.3.3
+lightrag-hku>=1.1.4
